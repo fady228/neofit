@@ -32,14 +32,6 @@ Demo logins (after `seed:demo`): `jamal@neofit.dev`, `sarah@neofit.dev`, coaches
 
 Checks: `cd backend && npm run test:e2e` (API must be running) and `npm run typecheck` in both folders.
 
-## Read this before you ship
-
-1. **Norms and zones are starting points.** Target zones are suggested defaults the athlete can edit; have a coach review them before launch (`target_zones.reviewedBy`).
-2. **Norms are placeholders.** `prisma/seed.ts` creates synthetic normal curves named "DEV PLACEHOLDER" so scoring works end to end. Replace them with sourced norm sets (see the norm-sourcing notes: FitnessVolt API, OpenPowerlifting for ceilings, FRIEND for VO2max, Marins/Cooper for push-ups). The app labels every score "Provisional" while a norm set is provisional. Have the licences reviewed before reusing published tables.
-3. **Auth is built-in email and password** (JWT, bcrypt). `User.authId` is ready for Firebase Auth, Clerk or Supabase if you prefer to swap it.
-4. **Use HTTPS in production.** Android blocks cleartext HTTP outside development.
-5. **Media upload is not built.** Avatars and post images need object storage (S3 or R2) and a signed-upload endpoint.
-
 ## How scoring works
 
 Lift logs feed scoring automatically: the best estimated 1RM (Epley, up to 12 reps) over 56 days is divided by bodyweight (chin-ups count bodyweight plus added load).
