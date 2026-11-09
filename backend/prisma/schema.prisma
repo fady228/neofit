@@ -1,0 +1,916 @@
+// NeoFit data model (PostgreSQL, Prisma 7)
+// The connection URL lives in prisma.config.ts, not in this file.
+//
+// Conventions
+//  - Canonical units are stored: kg, cm, metres, seconds. Convert in the client.
+//  - Rows the phone creates offline (workout_sessions, set_logs, conditioning_logs,
+//    test_results) use client-generated UUIDs so sync can be an idempotent upsert.
+//    They carry updatedAt + deletedAt so deletes sync as tombstones.
+//  - "isCurrent" tables keep history; exactly one row per key is current.
+//    Prisma cannot express partial unique indexes, so add them in the first migration
+//    (see the SQL block at the bottom of this file).
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum Role {
+  ATHLETE
+  COACH
+  ADMIN
+}
+
+enum Sex {
+  MALE
+  FEMALE
+}
+
+enum Level {
+  NOVICE
+  AMATEUR
+  PRO
+}
+
+enum Sport {
+  BOXING
+  KICKBOXING
+  MUAY_THAI
+  KARATE
+  TAEKWONDO
+  OTHER_STRIKING
+}
+
+enum ExerciseKind {
+  STRENGTH
+  POWER
+  CORE
+  CONDITIONING
+  MOBILITY
+}
+
+enum TrackingType {
+  LOAD_REPS
+  REPS
+  TIME
+  DISTANCE
+  ROUNDS
+}
+
+enum MeasureSite {
+  CHEST
+  WAIST
+  HIPS
+  THIGH
+  UPPER_ARM
+  NECK
+}
+
+enum Visibility {
+  PRIVATE
+  FOLLOWERS
+  PUBLIC
+}
+
+enum ProgramStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  ABANDONED
+}
+
+enum Feel {
+  EASY
+  SOLID
+  HARD
+  MAX
+}
+
+enum ConditioningMode {
+  ROUNDS
+  DISTANCE
+  TIMED
+}
+
+enum PrKind {
+  HEAVIEST_LOAD
+  BEST_E1RM
+  MOST_REPS
+  BEST_TIME
+  FARTHEST
+}
+
+enum TestValueKind {
+  LOAD_E1RM
+  REPS
+  DISTANCE_M
+  HEIGHT_CM
+  TIME_S
+  VO2_ESTIMATE
+}
+
+enum ScoringBasis {
+  ABSOLUTE
+  RELATIVE_BODYWEIGHT
+}
+
+enum ResultSource {
+  LOG_DERIVED
+  RETEST
+  MANUAL_ENTRY
+  IMPORT
+}
+
+enum TestPhase {
+  ONBOARDING
+  PROGRAM_BASELINE
+  PROGRAM_FINAL
+  AD_HOC
+}
+
+enum NormSourceKind {
+  OPEN_DATA
+  PUBLISHED_STUDY
+  THIRD_PARTY_API
+  OWN_USERS
+}
+
+enum ScoreKind {
+  ZONE // progress toward a target zone, capped at 100 (strength pillars)
+  PERCENTILE // standing against athletes like you
+}
+
+enum ZoneStatus {
+  BELOW
+  BUILDING
+  IN_ZONE
+  ABOVE
+}
+
+enum Confidence {
+  PROVISIONAL
+  MODERATE
+  HIGH
+}
+
+enum PostKind {
+  TEXT
+  MEDIA
+  QUOTE
+  WORKOUT_SHARE
+}
+
+enum Platform {
+  IOS
+  ANDROID
+}
+
+// ───────────────────────────── Identity ─────────────────────────────
+
+model User {
+  id        String    @id @default(uuid()) @db.Uuid
+  authId    String    @unique // "local:<id>" for built-in auth, or the uid from Firebase / Clerk / Supabase
+  passwordHash String?  // only set for built-in email + password auth
+  email     String    @unique
+  role      Role      @default(ATHLETE)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  athlete AthleteProfile?
+  coach   CoachProfile?
+
+  programs      Program[]
+  exercises     Exercise[]
+  posts         Post[]
+  comments      PostComment[]
+  likes         PostLike[]
+  bookmarks     PostBookmark[]
+  following     Follow[]       @relation("follower")
+  followers     Follow[]       @relation("following")
+  deviceTokens  DeviceToken[]
+
+  @@map("users")
+}
+
+model AthleteProfile {
+  userId     String  @id @db.Uuid
+  username   String  @unique
+  bio        String? @db.VarChar(150)
+  avatarUrl  String?
+  sex        Sex?
+  birthDate  DateTime? @db.Date
+  sport      Sport   @default(BOXING)
+  level      Level   @default(AMATEUR)
+  weightClass String?
+  roleModels String[]
+  instagram  String?
+  youtube    String?
+
+  onboardingStep    Int       @default(0)
+  researchConsentAt DateTime? // user agreed to anonymised results feeding our own norms
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  bodyweight   BodyweightLog[]
+  measurements BodyMeasurement[]
+  enrollments  ProgramEnrollment[]
+  workouts     WorkoutSession[]
+  setLogs      SetLog[]
+  conditioning ConditioningLog[]
+  records      PersonalRecord[]
+  pillarTests  AthletePillarTest[]
+  testResults  TestResult[]
+  pillarScores PillarScore[]
+  targetZones  AthleteTargetZone[]
+  goalScores   GoalScore[]
+
+  @@index([sport, level, sex])
+  @@map("athlete_profiles")
+}
+
+model CoachProfile {
+  userId          String    @id @db.Uuid
+  bio             String?
+  yearsExperience Int?
+  gym             String?
+  verifiedAt      DateTime?
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("coach_profiles")
+}
+
+model Follow {
+  followerId  String   @db.Uuid
+  followingId String   @db.Uuid
+  createdAt   DateTime @default(now())
+
+  follower  User @relation("follower", fields: [followerId], references: [id], onDelete: Cascade)
+  following User @relation("following", fields: [followingId], references: [id], onDelete: Cascade)
+
+  @@id([followerId, followingId])
+  @@index([followingId])
+  @@map("follows")
+}
+
+model DeviceToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  token     String   @unique
+  platform  Platform
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("device_tokens")
+}
+
+// ───────────────────────────── Body stats ─────────────────────────────
+
+model BodyweightLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  athleteId  String   @db.Uuid
+  kg         Decimal  @db.Decimal(5, 2)
+  bodyFatPct Decimal? @db.Decimal(4, 1)
+  measuredAt DateTime
+  athlete    AthleteProfile @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+
+  @@index([athleteId, measuredAt(sort: Desc)])
+  @@map("bodyweight_logs")
+}
+
+model BodyMeasurement {
+  id         String      @id @default(uuid()) @db.Uuid
+  athleteId  String      @db.Uuid
+  site       MeasureSite
+  cm         Decimal     @db.Decimal(5, 1)
+  measuredAt DateTime
+  athlete    AthleteProfile @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+
+  @@index([athleteId, site, measuredAt(sort: Desc)])
+  @@map("body_measurements")
+}
+
+// ───────────────────────────── Exercise library ─────────────────────────────
+
+model Exercise {
+  id             String       @id @default(uuid()) @db.Uuid // stable ID, also used by the AI program builder
+  slug           String       @unique
+  name           String
+  kind           ExerciseKind
+  tracking       TrackingType @default(LOAD_REPS)
+  primaryMuscles String[]
+  equipment      String[]
+  isCustom       Boolean      @default(false)
+  createdById    String?      @db.Uuid // null = built-in library
+  archivedAt     DateTime?
+  createdAt      DateTime     @default(now())
+
+  createdBy User? @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  sessionExercises SessionExercise[]
+  setLogs          SetLog[]
+  conditioning     ConditioningLog[]
+  records          PersonalRecord[]
+  tests            Test[]
+  balanceRefs      BalanceRule[]     @relation("balanceReference")
+  balanceTargets   BalanceRule[]     @relation("balanceTarget")
+
+  @@index([kind])
+  @@index([name])
+  @@map("exercises")
+}
+
+// ───────────────────────────── Programs ─────────────────────────────
+
+model Program {
+  id            String        @id @default(uuid()) @db.Uuid
+  ownerId       String        @db.Uuid // athlete (private builder) or coach
+  title         String
+  description   String?
+  sport         Sport         @default(BOXING)
+  level         Level         @default(AMATEUR)
+  goalId        String?       @db.Uuid
+  durationWeeks Int
+  daysPerWeek   Int
+  visibility    Visibility    @default(PRIVATE)
+  status        ProgramStatus @default(DRAFT)
+  publishedAt   DateTime?
+  clonedFromId  String?       @db.Uuid
+  ratingAvg     Decimal?      @db.Decimal(2, 1) // denormalised, refreshed on review
+  ratingCount   Int           @default(0)
+  enrolledCount Int           @default(0)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  owner      User      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  goal       Goal?     @relation(fields: [goalId], references: [id], onDelete: SetNull)
+  clonedFrom Program?  @relation("clones", fields: [clonedFromId], references: [id], onDelete: SetNull)
+  clones     Program[] @relation("clones")
+
+  blocks      ProgramBlock[]
+  enrollments ProgramEnrollment[]
+
+  @@index([ownerId])
+  @@index([status, visibility, sport])
+  @@map("programs")
+}
+
+model ProgramBlock {
+  id        String @id @default(uuid()) @db.Uuid
+  programId String @db.Uuid
+  position  Int
+  name      String
+  startWeek Int
+  endWeek   Int
+
+  program  Program          @relation(fields: [programId], references: [id], onDelete: Cascade)
+  sessions ProgramSession[]
+
+  @@unique([programId, position])
+  @@map("program_blocks")
+}
+
+model ProgramSession {
+  id       String  @id @default(uuid()) @db.Uuid
+  blockId  String  @db.Uuid
+  position Int
+  name     String
+  focus    String?
+
+  block     ProgramBlock      @relation(fields: [blockId], references: [id], onDelete: Cascade)
+  exercises SessionExercise[]
+  workouts  WorkoutSession[]
+
+  @@unique([blockId, position])
+  @@map("program_sessions")
+}
+
+model SessionExercise {
+  id            String  @id @default(uuid()) @db.Uuid
+  sessionId     String  @db.Uuid
+  exerciseId    String  @db.Uuid
+  position      Int
+  targetSets    Int?
+  targetReps    Int?
+  targetRepsMax Int?
+  percent1RM    Int?
+  restSec       Int?
+  workSec       Int?
+  rounds        Int?
+  supersetGroup String?
+  notes         String?
+
+  session  ProgramSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  exercise Exercise       @relation(fields: [exerciseId], references: [id])
+  setLogs  SetLog[]
+
+  @@unique([sessionId, position])
+  @@map("session_exercises")
+}
+
+model ProgramEnrollment {
+  id           String           @id @default(uuid()) @db.Uuid
+  athleteId    String           @db.Uuid
+  programId    String           @db.Uuid
+  status       EnrollmentStatus @default(ACTIVE)
+  startedAt    DateTime         @default(now())
+  completedAt  DateTime?
+  trainingDays Int[] // 1 = Monday ... 7 = Sunday
+  reminderTime String? // "08:00" local time
+  timezone     String?
+  rating       Int? // 1-5, set on completion
+  review       String?
+
+  athlete AthleteProfile @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+  program Program        @relation(fields: [programId], references: [id], onDelete: Cascade)
+
+  workouts    WorkoutSession[]
+  testResults TestResult[]
+
+  @@index([athleteId, status])
+  @@index([programId])
+  @@map("program_enrollments")
+}
+
+// ───────────────────────────── Workout logging ─────────────────────────────
+
+model WorkoutSession {
+  id               String    @id @db.Uuid // client-generated
+  athleteId        String    @db.Uuid
+  enrollmentId     String?   @db.Uuid
+  programSessionId String?   @db.Uuid
+  title            String
+  startedAt        DateTime
+  endedAt          DateTime?
+  feel             Feel?
+  notes            String?
+  totalVolumeKg    Decimal?  @db.Decimal(9, 1) // denormalised on finish
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  deletedAt        DateTime?
+
+  athlete        AthleteProfile     @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+  enrollment     ProgramEnrollment? @relation(fields: [enrollmentId], references: [id], onDelete: SetNull)
+  programSession ProgramSession?    @relation(fields: [programSessionId], references: [id], onDelete: SetNull)
+
+  sets         SetLog[]
+  conditioning ConditioningLog[]
+  posts        Post[]
+
+  @@index([athleteId, startedAt(sort: Desc)])
+  @@index([updatedAt])
+  @@map("workout_sessions")
+}
+
+model SetLog {
+  id                String    @id @db.Uuid // client-generated
+  sessionId         String    @db.Uuid
+  athleteId         String    @db.Uuid // denormalised so exercise history is one indexed query
+  exerciseId        String    @db.Uuid
+  sessionExerciseId String?   @db.Uuid
+  setNumber         Int
+  weightKg          Decimal?  @db.Decimal(6, 2)
+  reps              Int?
+  durationSec       Int?
+  distanceM         Decimal?  @db.Decimal(8, 2)
+  rpe               Decimal?  @db.Decimal(3, 1)
+  isWarmup          Boolean   @default(false)
+  e1rmKg            Decimal?  @db.Decimal(6, 2) // computed server-side on write
+  completedAt       DateTime
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
+
+  session         WorkoutSession   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  athlete         AthleteProfile   @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+  exercise        Exercise         @relation(fields: [exerciseId], references: [id])
+  sessionExercise SessionExercise? @relation(fields: [sessionExerciseId], references: [id], onDelete: SetNull)
+
+  records     PersonalRecord[]
+  testResults TestResult[]
+
+  @@index([athleteId, exerciseId, completedAt(sort: Desc)])
+  @@index([sessionId])
+  @@index([updatedAt])
+  @@map("set_logs")
+}
+
+model ConditioningLog {
+  id          String           @id @db.Uuid // client-generated
+  sessionId   String           @db.Uuid
+  athleteId   String           @db.Uuid
+  exerciseId  String?          @db.Uuid
+  mode        ConditioningMode
+  rounds      Int?
+  workSec     Int?
+  restSec     Int?
+  distanceM   Decimal?         @db.Decimal(8, 1)
+  durationSec Int?
+  avgHr       Int?
+  rpe         Int?
+  completedAt DateTime
+  updatedAt   DateTime         @updatedAt
+  deletedAt   DateTime?
+
+  session  WorkoutSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  athlete  AthleteProfile @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+  exercise Exercise?      @relation(fields: [exerciseId], references: [id])
+
+  @@index([athleteId, completedAt(sort: Desc)])
+  @@map("conditioning_logs")
+}
+
+model PersonalRecord {
+  id            String   @id @default(uuid()) @db.Uuid
+  athleteId     String   @db.Uuid
+  exerciseId    String   @db.Uuid
+  kind          PrKind
+  value         Decimal  @db.Decimal(9, 2)
+  previousValue Decimal? @db.Decimal(9, 2)
+  reps          Int?
+  setLogId      String?  @db.Uuid
+  achievedAt    DateTime
+
+  athlete  AthleteProfile @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+  exercise Exercise       @relation(fields: [exerciseId], references: [id])
+  setLog   SetLog?        @relation(fields: [setLogId], references: [id], onDelete: SetNull)
+
+  @@index([athleteId, exerciseId, kind, achievedAt(sort: Desc)])
+  @@map("personal_records")
+}
+
+// ───────────────────────────── Pillars, tests, norms, scores ─────────────────────────────
+
+model Pillar {
+  id         String  @id @default(uuid()) @db.Uuid
+  key        String  @unique // LOWER_STRENGTH, PUSH_STRENGTH, PULL_STRENGTH, LOWER_POWER, ...
+  name       String
+  position   Int
+  isOptional Boolean @default(false) // e.g. rotational power until norms exist
+  onRadar    Boolean @default(true)
+
+  options        PillarTestOption[]
+  tests          Test[]
+  athleteChoices AthletePillarTest[]
+  scores         PillarScore[]
+  goalComponents GoalComponent[]
+
+  @@map("pillars")
+}
+
+model Test {
+  id             String        @id @default(uuid()) @db.Uuid
+  key            String        @unique // FRONT_SQUAT_E1RM, COOPER_12MIN, PUSHUPS_60S, ...
+  pillarId       String        @db.Uuid
+  name           String
+  protocol       String? // how to perform it, shown in the app
+  unit           String // kg, reps, m, cm, s, ml/kg/min
+  valueKind      TestValueKind
+  scoring        ScoringBasis  @default(ABSOLUTE)
+  transformKey   String? // e.g. "cooper_vo2" converts distance to VO2 before the norm lookup
+  higherIsBetter Boolean       @default(true)
+  exerciseId     String?       @db.Uuid // lift tests link to the library so logs can feed them
+  isActive       Boolean       @default(true)
+
+  pillar   Pillar    @relation(fields: [pillarId], references: [id])
+  exercise Exercise? @relation(fields: [exerciseId], references: [id], onDelete: SetNull)
+
+  options        PillarTestOption[]
+  athleteChoices AthletePillarTest[]
+  results        TestResult[]
+  normSets       NormSet[]
+  zones          TargetZone[]
+  athleteZones   AthleteTargetZone[]
+  scores         PillarScore[]
+
+  @@index([pillarId])
+  @@map("tests")
+}
+
+// Which tests are offered for a pillar, and which is the default for each sport.
+model PillarTestOption {
+  pillarId  String  @db.Uuid
+  testId    String  @db.Uuid
+  sport     Sport
+  isDefault Boolean @default(false)
+  position  Int     @default(0)
+
+  pillar Pillar @relation(fields: [pillarId], references: [id], onDelete: Cascade)
+  test   Test   @relation(fields: [testId], references: [id], onDelete: Cascade)
+
+  @@id([pillarId, testId, sport])
+  @@map("pillar_test_options")
+}
+
+// The test an athlete picked for each pillar.
+model AthletePillarTest {
+  athleteId String   @db.Uuid
+  pillarId  String   @db.Uuid
+  testId    String   @db.Uuid
+  chosenAt  DateTime @default(now())
+
+  athlete AthleteProfile @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+  pillar  Pillar         @relation(fields: [pillarId], references: [id])
+  test    Test           @relation(fields: [testId], references: [id])
+
+  @@id([athleteId, pillarId])
+  @@map("athlete_pillar_tests")
+}
+
+model TestResult {
+  id            String       @id @db.Uuid // client-generated
+  athleteId     String       @db.Uuid
+  testId        String       @db.Uuid
+  value         Decimal      @db.Decimal(10, 3) // in the test's canonical unit
+  bodyweightKg  Decimal?     @db.Decimal(5, 2) // snapshot, needed for relative scoring
+  ageYears      Int? // snapshot at test time
+  source        ResultSource
+  phase         TestPhase    @default(AD_HOC)
+  enrollmentId  String?      @db.Uuid
+  setLogId      String?      @db.Uuid // set that produced a log-derived result
+  performedAt   DateTime
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  deletedAt     DateTime?
+
+  athlete    AthleteProfile     @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+  test       Test               @relation(fields: [testId], references: [id])
+  enrollment ProgramEnrollment? @relation(fields: [enrollmentId], references: [id], onDelete: SetNull)
+  setLog     SetLog?            @relation(fields: [setLogId], references: [id], onDelete: SetNull)
+
+  @@index([athleteId, testId, performedAt(sort: Desc)])
+  @@index([enrollmentId, phase])
+  @@map("test_results")
+}
+
+// One versioned norm table for one test, with full provenance.
+model NormSet {
+  id          String         @id @default(uuid()) @db.Uuid
+  testId      String         @db.Uuid
+  version     Int
+  name        String
+  population  String // "Self-reported gym lifters", "US adults, treadmill", ...
+  sourceKind  NormSourceKind
+  citation    String
+  url         String?
+  license     String?
+  attribution String? // text we must display when using this set
+  sampleSize  Int?
+  confidence  Confidence     @default(PROVISIONAL)
+  isActive    Boolean        @default(false)
+  reviewedAt  DateTime? // licence / reuse review completed
+  createdAt   DateTime       @default(now())
+
+  test   Test         @relation(fields: [testId], references: [id], onDelete: Cascade)
+  cells  NormCell[]
+  scores PillarScore[]
+
+  @@unique([testId, version])
+  @@map("norm_sets")
+}
+
+model NormCell {
+  id          String   @id @default(uuid()) @db.Uuid
+  normSetId   String   @db.Uuid
+  sex         Sex
+  ageMin      Int
+  ageMax      Int
+  bwMinKg     Decimal? @db.Decimal(5, 1)
+  bwMaxKg     Decimal? @db.Decimal(5, 1)
+  n           Int?
+  percentiles Json // {"p5": 38, "p25": 55, "p50": 70, "p75": 88, "p95": 110}
+
+  normSet NormSet       @relation(fields: [normSetId], references: [id], onDelete: Cascade)
+  scores  PillarScore[]
+
+  @@index([normSetId, sex, ageMin, ageMax])
+  @@map("norm_cells")
+}
+
+model PillarScore {
+  id         String     @id @default(uuid()) @db.Uuid
+  athleteId  String     @db.Uuid
+  pillarId   String     @db.Uuid
+  testId     String     @db.Uuid
+  rawValue   Decimal    @db.Decimal(10, 3)
+  scoredValue Decimal   @db.Decimal(10, 3) // value after relative-to-bodyweight / transform
+  percentile Decimal?   @db.Decimal(5, 2) // standing vs athletes like you; informational for zone pillars
+  score      Decimal    @db.Decimal(5, 2) // what the radar, goals and leaderboards use (0 to 100)
+  scoreKind  ScoreKind
+  zoneLow    Decimal?   @db.Decimal(6, 3)
+  zoneHigh   Decimal?   @db.Decimal(6, 3)
+  zoneStatus ZoneStatus?
+  zoneCustom Boolean    @default(false)
+  normSetId  String?    @db.Uuid
+  normCellId String?    @db.Uuid
+  confidence Confidence
+  computedAt DateTime   @default(now())
+  isCurrent  Boolean    @default(true)
+
+  athlete  AthleteProfile @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+  pillar   Pillar         @relation(fields: [pillarId], references: [id])
+  test     Test           @relation(fields: [testId], references: [id])
+  normSet  NormSet?       @relation(fields: [normSetId], references: [id])
+  normCell NormCell?      @relation(fields: [normCellId], references: [id], onDelete: SetNull)
+
+  @@index([athleteId, pillarId, computedAt(sort: Desc)])
+  @@index([pillarId, percentile])
+  @@map("pillar_scores")
+}
+
+// Suggested target zone for a test, by sex. Strength is scored as progress toward this band and
+// capped at 100: past the zone the app says "maintain" instead of "more". NeoFit ships suggested
+// defaults; the athlete can override them (AthleteTargetZone).
+model TargetZone {
+  id         String    @id @default(uuid()) @db.Uuid
+  testId     String    @db.Uuid
+  sex        Sex
+  low        Decimal   @db.Decimal(6, 3) // in the test's scored unit, e.g. e1RM / bodyweight
+  high       Decimal   @db.Decimal(6, 3)
+  rationale  String
+  source     String    @default("NeoFit suggested default")
+  reviewedBy String?
+  reviewedAt DateTime?
+  isActive   Boolean   @default(true)
+  createdAt  DateTime  @default(now())
+
+  test Test @relation(fields: [testId], references: [id], onDelete: Cascade)
+
+  @@unique([testId, sex])
+  @@map("target_zones")
+}
+
+model AthleteTargetZone {
+  athleteId String   @db.Uuid
+  testId    String   @db.Uuid
+  low       Decimal  @db.Decimal(6, 3)
+  high      Decimal  @db.Decimal(6, 3)
+  updatedAt DateTime @updatedAt
+
+  athlete AthleteProfile @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+  test    Test           @relation(fields: [testId], references: [id], onDelete: Cascade)
+
+  @@id([athleteId, testId])
+  @@map("athlete_target_zones")
+}
+
+// ───────────────────────────── Goals (e.g. Punch power) ─────────────────────────────
+
+model Goal {
+  id          String @id @default(uuid()) @db.Uuid
+  key         String @unique // PUNCH_POWER
+  name        String
+  description String?
+
+  components GoalComponent[]
+  scores     GoalScore[]
+  programs   Program[]
+
+  @@map("goals")
+}
+
+model GoalComponent {
+  id          String  @id @default(uuid()) @db.Uuid
+  goalId      String  @db.Uuid
+  key         String // FOUNDATION, ACCELERATOR, TRANSFER
+  name        String
+  weight      Decimal @db.Decimal(4, 3) // components sum to 1
+  pillarId    String  @db.Uuid
+  explanation String?
+
+  goal   Goal   @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  pillar Pillar @relation(fields: [pillarId], references: [id])
+
+  @@unique([goalId, key])
+  @@map("goal_components")
+}
+
+model GoalScore {
+  id              String   @id @default(uuid()) @db.Uuid
+  athleteId       String   @db.Uuid
+  goalId          String   @db.Uuid
+  score           Decimal  @db.Decimal(5, 2)
+  componentScores Json // {"FOUNDATION": 86, "ACCELERATOR": 72, "TRANSFER": 55}
+  computedAt      DateTime @default(now())
+  isCurrent       Boolean  @default(true)
+
+  athlete AthleteProfile @relation(fields: [athleteId], references: [userId], onDelete: Cascade)
+  goal    Goal           @relation(fields: [goalId], references: [id])
+
+  @@index([athleteId, goalId, computedAt(sort: Desc)])
+  @@map("goal_scores")
+}
+
+// Strength-balance panel: target ratio between two lifts (kept off the radar).
+model BalanceRule {
+  id                  String  @id @default(uuid()) @db.Uuid
+  key                 String  @unique
+  referenceExerciseId String  @db.Uuid
+  targetExerciseId    String  @db.Uuid
+  targetRatio         Decimal @db.Decimal(5, 3) // e.g. 0.750 = bench at 75% of squat
+  tolerance           Decimal @db.Decimal(4, 3) @default(0.100)
+  sourceNote          String // coach-derived, not population data: say so in the app
+  isActive            Boolean @default(true)
+
+  reference Exercise @relation("balanceReference", fields: [referenceExerciseId], references: [id])
+  target    Exercise @relation("balanceTarget", fields: [targetExerciseId], references: [id])
+
+  @@map("balance_rules")
+}
+
+// Cache for ranked cohorts; rebuilt by a job when scores change.
+model LeaderboardEntry {
+  id         String   @id @default(uuid()) @db.Uuid
+  cohortKey  String // "AMATEUR|MALE|MIDDLEWEIGHT|18-35"
+  metricKey  String // "GOAL:PUNCH_POWER" or "PILLAR:LOWER_STRENGTH"
+  athleteId  String   @db.Uuid
+  percentile Decimal  @db.Decimal(5, 2)
+  rank       Int
+  delta30d   Decimal? @db.Decimal(5, 2)
+  updatedAt  DateTime @updatedAt
+
+  @@unique([cohortKey, metricKey, athleteId])
+  @@index([cohortKey, metricKey, rank])
+  @@map("leaderboard_entries")
+}
+
+// ───────────────────────────── Social ─────────────────────────────
+
+model Post {
+  id               String    @id @default(uuid()) @db.Uuid
+  authorId         String    @db.Uuid
+  kind             PostKind  @default(TEXT)
+  body             String
+  mediaUrls        String[]
+  workoutSessionId String?   @db.Uuid
+  createdAt        DateTime  @default(now())
+  deletedAt        DateTime?
+
+  author  User            @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  workout WorkoutSession? @relation(fields: [workoutSessionId], references: [id], onDelete: SetNull)
+
+  likes     PostLike[]
+  comments  PostComment[]
+  bookmarks PostBookmark[]
+
+  @@index([authorId, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+  @@map("posts")
+}
+
+model PostLike {
+  postId    String   @db.Uuid
+  userId    String   @db.Uuid
+  createdAt DateTime @default(now())
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([postId, userId])
+  @@map("post_likes")
+}
+
+model PostBookmark {
+  postId    String   @db.Uuid
+  userId    String   @db.Uuid
+  createdAt DateTime @default(now())
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([postId, userId])
+  @@map("post_bookmarks")
+}
+
+model PostComment {
+  id        String    @id @default(uuid()) @db.Uuid
+  postId    String    @db.Uuid
+  authorId  String    @db.Uuid
+  body      String
+  createdAt DateTime  @default(now())
+  deletedAt DateTime?
+  post      Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author    User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([postId, createdAt])
+  @@map("post_comments")
+}
+
+// ───────────────────────────── Raw SQL for the first migration ─────────────────────────────
+//
+// Append prisma/sql/partial-indexes.sql to the first migration. Column names are
+// camelCase because the schema does not @map fields.
